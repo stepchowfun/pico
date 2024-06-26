@@ -1,0 +1,4 @@
+# Keep this in sync with [ref:excluded_input_paths].
+/.vscode
+/out.elf
+/out.uf2

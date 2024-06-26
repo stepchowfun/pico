@@ -1,0 +1,159 @@
+image: ubuntu:24.04
+default: build-main
+user: user
+command_prefix: |
+  # Make not silently ignore errors.
+  set -euo pipefail
+
+  # Make Bash log commands.
+  set -x
+tasks:
+  install_packages:
+    description: Install system packages.
+    user: root
+    command: |
+      # Install the following packages:
+      #
+      # - build-essential                - Used by the Raspberry Pi Pico SDK
+      # - clang-format                   - Used to format source code
+      # - cmake                          - Used by the Raspberry Pi Pico SDK
+      # - curl                           - Used for installing Tagref
+      # - gcc-arm-none-eabi              - Used by the Raspberry Pi Pico SDK
+      # - libnewlib-arm-none-eabi        - Used by the Raspberry Pi Pico SDK
+      # - libstdc++-arm-none-eabi-newlib - Used by the Raspberry Pi Pico SDK
+      # - python3                        - Used by the Raspberry Pi Pico SDK
+      # - ripgrep                        - Used for various linting tasks
+      apt-get update
+      apt-get install --yes \
+        build-essential \
+        clang-format \
+        cmake \
+        curl \
+        gcc-arm-none-eabi \
+        libnewlib-arm-none-eabi \
+        libstdc++-arm-none-eabi-newlib \
+        python3 \
+        ripgrep
+
+  install_tagref:
+    description: Install Tagref, a reference checking tool.
+    dependencies:
+      - install_packages
+    user: root
+    command: |
+      # Install Tagref using the official installer script.
+      curl https://raw.githubusercontent.com/stepchowfun/tagref/main/install.sh -LSfs | sh
+
+  create_user:
+    description: Create a user who doesn't have root privileges.
+    user: root
+    command: |
+      # Create a user named `user` with a home directory and with Bash as the login shell.
+      useradd user --create-home --shell /bin/bash
+
+      # Without this, Ruby will assume files are encoded as ASCII.
+      echo 'export LANG="C.UTF-8"' >> /home/user/.profile
+
+  install_tools:
+    description: Install the tools needed to build and validate the program.
+    dependencies:
+      - create_user
+      - install_packages
+      - install_tagref
+
+  sdk_and_examples:
+    description: Import the Raspberry Pi Pico SDK and examples.
+    input_paths:
+      - pico-examples
+      - pico-sdk
+
+  main:
+    description: Import the source code for main.
+    input_paths:
+      - main
+
+  build-main:
+    description: Build the binary.
+    environment:
+      PICO_BOARD: pico_w # pico or pico_w
+      BUILD_TYPE: Release
+    dependencies:
+      - install_tools
+      - sdk_and_examples
+      - main
+    output_paths:
+      - out.uf2
+      - out.elf
+    user: user
+    command: |
+      # Build the project.
+      export PICO_SDK_PATH=/scratch/pico-sdk
+      mkdir build
+      cd build
+      cmake "../main" -DPICO_BOARD="$PICO_BOARD" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+      make -j "$(grep -c '^processor' /proc/cpuinfo)"
+      cp main.uf2 ../out.uf2
+      cp main.elf ../out.elf
+
+  build-example:
+    description: Build an example project.
+    environment:
+      PICO_BOARD: pico_w # pico or pico_w
+      BUILD_TYPE: Release
+      PROJECT: pico_w/wifi/blink
+    dependencies:
+      - install_tools
+      - sdk_and_examples
+    output_paths:
+      - out.uf2
+      - out.elf
+    user: user
+    command: |
+      # Build the project.
+      export PICO_SDK_PATH=/scratch/pico-sdk
+      mkdir pico-examples/build
+      (cd pico-examples/build && cmake .. -DPICO_BOARD="$PICO_BOARD" -DCMAKE_BUILD_TYPE="$BUILD_TYPE")
+      (cd "pico-examples/build/$PROJECT" && make -j "$(grep -c '^processor' /proc/cpuinfo)")
+      cp "pico-examples/build/$PROJECT/"*.uf2 out.uf2
+      cp "pico-examples/build/$PROJECT/"*.elf out.elf
+
+  lint:
+    description: Run the linters.
+    dependencies:
+      - install_tools
+      - main
+    input_paths:
+      - .
+    excluded_input_paths:
+      - .git
+
+      # [tag:excluded_input_paths] Keep this in sync with [file:.gitignore].
+      - .vscode
+      - out.elf
+      - out.uf2
+    command: |
+      # Check references with Tagref.
+      tagref
+
+      # Check code formatting with ClangFormat.
+      if ! clang-format --Werror --dry-run main/**/*.c; then
+        echo 'ERROR: Please correct the formatting errors above.' 1>&2
+        exit 1
+      fi
+
+      # Enforce that lines span no more than 100 columns.
+      if rg --line-number --type c '.{101}' main; then
+        echo 'There are lines spanning more than 100 columns.' >&2
+        exit 1
+      fi
+
+  format:
+    description: Format the source code.
+    dependencies:
+      - install_tools
+      - main
+    output_paths:
+      - main
+    command: |
+      # Format the code with ClangFormat.
+      clang-format -i main/**/*.c
