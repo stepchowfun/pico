@@ -1,71 +1,125 @@
 #include "hardware/gpio.h"
-#include "hardware/i2c.h"
 #include "hardware/pwm.h"
+#include "hardware/spi.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include <stdio.h>
 
-// Determined by experimentation
-#define I2C_BAUD_RATE 1000 * 1000
-#define I2C_PER_BYTE_TIMEOUT_US 1000
+// According to the datasheet, the AS5048A supports a maximum clock frequency
+// of 100 MHz. However, the Raspberry Pi Pico can't go higher than 10 MHz.
+#define SPI_BAUD_RATE 10 * 1000 * 1000
 
-// From the AS5600 datasheet
-#define AS5600_ADDRESS 0x36
-#define AS5600_RAW_ANGLE_REGISTER 0x0c
-#define AS5600_AGC_REGISTER 0x1a
+// From the AS5048A datasheet
+#define AS5048A_ANGLE_COMMAND 0xffff
+#define AS5048A_DIAGNOSTIC_AGC_COMMAND 0x7ffd
+#define AS5048A_CLEAR_ERROR_COMMAND 0x4001
 
 #define LED_GPIO 22
 
-// Read from the given I2C bus with a per-byte timeout. Returns whether the
-// read succeeded and prints any errors.
-bool i2c_read(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len,
-              bool nostop) {
-  int result = i2c_read_timeout_per_char_us(i2c, addr, dst, len, nostop,
-                                            I2C_PER_BYTE_TIMEOUT_US);
-  if (result == PICO_ERROR_TIMEOUT) {
-    printf("Timed out while reading data over I2C.\n");
+static inline void spi_select() {
+  gpio_put(PICO_DEFAULT_SPI_CSN_PIN, 0);
+
+  // Assuming 133 MHz, wait 47 cycles to wait out the minimum 350 ns duration
+  // between CSn falling edge and CLK rising edge (from the AS5048A datasheet).
+  asm volatile(
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop");
+}
+
+static inline void spi_deselect() {
+  // Assuming 133 MHz, wait 7 cycles to wait out the minimum 50 ns duration
+  // between CLK falling edge and CSn rising edge (from the AS5048A datasheet).
+  asm volatile("nop \n nop \n nop \n nop \n nop \n nop \n nop");
+
+  gpio_put(PICO_DEFAULT_SPI_CSN_PIN, 1);
+
+  // Assuming 133 MHz, wait 47 cycles to wait out the minimum 350 ns high time
+  // between two transmissions (from the AS5048A datasheet).
+  asm volatile(
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n nop \n "
+      "nop \n nop \n nop \n nop \n nop \n nop \n nop");
+}
+
+static void spi_clear_error(spi_inst_t *spi);
+
+// Write two bytes to the SPI bus, then read two bytes. Returns whether the
+// operation succeeded.
+static bool spi_request(spi_inst_t *spi, uint16_t command, uint16_t *result,
+                        bool attempt_clear_error) {
+  spi_select();
+  int halfwords_written = spi_write16_blocking(spi_default, &command, 1);
+  spi_deselect();
+
+  if (halfwords_written != 1) {
+    printf("Attempted to write 1 halfword, but %d were written.\n",
+           halfwords_written);
+    if (attempt_clear_error) {
+      spi_clear_error(spi);
+    }
     return false;
   }
-  if (result == PICO_ERROR_GENERIC) {
-    printf("Error reading data over I2C.\n");
+
+  uint16_t response = 0;
+  spi_select();
+  int halfwords_read = spi_read16_blocking(spi_default, 0, &response, 1);
+  spi_deselect();
+
+  if (halfwords_read != 1) {
+    printf("Attempted to read 1 halfword, but %d were read.\n", halfwords_read);
+    if (attempt_clear_error) {
+      spi_clear_error(spi);
+    }
     return false;
   }
+
+  if ((response >> 14) & 0x01) {
+    printf("Transmission error.\n");
+    if (attempt_clear_error) {
+      spi_clear_error(spi);
+    }
+    return false;
+  }
+
+  *result = response & 0x3FFF;
+
   return true;
 }
 
-// Write to the given I2C bus with a per-byte timeout. Returns whether the
-// write succeeded and prints any errors.
-bool i2c_write(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len,
-               bool nostop) {
-  int result = i2c_write_timeout_per_char_us(i2c, addr, src, len, nostop,
-                                             I2C_PER_BYTE_TIMEOUT_US);
-  if (result == PICO_ERROR_TIMEOUT) {
-    printf("Timed out while writing data over I2C.\n");
-    return false;
+// Attempt to clear the error flag on the SPI device.
+static void spi_clear_error(spi_inst_t *spi) {
+  uint16_t clear_error_result = 0;
+  if (spi_request(spi, AS5048A_CLEAR_ERROR_COMMAND, &clear_error_result,
+                  false)) {
+    printf("Framing error: %d\n", clear_error_result & 0x01);
+    printf("Command invalid: %d\n", (clear_error_result >> 1) & 0x01);
+    printf("Parity error: %d\n", (clear_error_result >> 2) & 0x01);
   }
-  if (result == PICO_ERROR_GENERIC) {
-    printf("Error writing data over I2C.\n");
-    return false;
-  }
-  return true;
 }
 
 // Let the fun begin!
 int main() {
-  // We need to pass these values by reference, so give them an address on the
-  // stack.
-  uint8_t raw_angle_register = AS5600_RAW_ANGLE_REGISTER;
-  uint8_t agc_register = AS5600_AGC_REGISTER;
-
   // Initialize UART.
   stdio_init_all();
 
-  // Initialize I2C for the AS5600.
-  i2c_init(i2c_default, I2C_BAUD_RATE);
-  gpio_set_function(PICO_DEFAULT_I2C_SDA_PIN, GPIO_FUNC_I2C);
-  gpio_set_function(PICO_DEFAULT_I2C_SCL_PIN, GPIO_FUNC_I2C);
-  gpio_pull_up(PICO_DEFAULT_I2C_SDA_PIN);
-  gpio_pull_up(PICO_DEFAULT_I2C_SCL_PIN);
+  // Intiialize SPI for the AS5048A.
+  spi_init(spi_default, SPI_BAUD_RATE);
+  spi_set_format(spi_default, 16, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
+  gpio_set_function(PICO_DEFAULT_SPI_RX_PIN, GPIO_FUNC_SPI);
+  gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
+  gpio_set_function(PICO_DEFAULT_SPI_TX_PIN, GPIO_FUNC_SPI);
+  gpio_init(PICO_DEFAULT_SPI_CSN_PIN);
+  gpio_put(PICO_DEFAULT_SPI_CSN_PIN, 1);
+  gpio_set_dir(PICO_DEFAULT_SPI_CSN_PIN, GPIO_OUT);
+
+  // According to its datasheet, the AS5048A has a maximum startup time of
+  // 10ms. Sleep for that long to give it time to boot.
+  sleep_ms(10);
 
   // Initialize PWM for the LED.
   uint slice_num = pwm_gpio_to_slice_num(LED_GPIO);
@@ -77,40 +131,52 @@ int main() {
   // Print a message indicating that we're ready to start.
   printf("Booted.\n");
 
-  // We'll use the AS5600 to implement a volume knob.
-  uint16_t volume = 0; // [0, 4096)
+  // We'll use the AS5048A to implement a volume knob.
+  uint16_t volume = 0; // [0, 16384)
 
   // The volume changes based on the change in angle, so we need to remember
   // the angle from the previous iteration.
-  uint16_t previous_angle = 0; // [0, 4096)
+  uint16_t previous_angle = 0; // [0, 16384)
 
   // The main program loop
   while (true) {
-    // Read the gain.
-    uint8_t gain = 0; // [0, 128]
-    if (!i2c_write(i2c_default, AS5600_ADDRESS, &agc_register, 1, true)) {
+    // Read the diagnostics and gain data.
+    uint16_t diagnostic_agc;
+    if (!spi_request(spi_default, AS5048A_DIAGNOSTIC_AGC_COMMAND,
+                     &diagnostic_agc, true)) {
       continue;
     }
-    if (!i2c_read(i2c_default, AS5600_ADDRESS, &gain, 1, false)) {
+    uint8_t gain = (uint8_t)diagnostic_agc; // [0, 256)
+    if (!((diagnostic_agc >> 8) & 0x01)) {
+      printf("Offset compensation not yet finished.\n");
+      continue;
+    }
+    if ((diagnostic_agc >> 9) & 0x01) {
+      printf("CORDIC overflow.\n");
+      continue;
+    }
+    if ((diagnostic_agc >> 10) & 0x01) {
+      printf("High magnetic field (gain: %d / 255).\n", gain);
+      continue;
+    }
+    if ((diagnostic_agc >> 11) & 0x01) {
+      printf("Weak magnetic field (gain %d / 255).\n", gain);
       continue;
     }
 
     // Read the angle.
-    uint8_t angle_bytes[2] = {0, 0}; // [0, 4096)
-    if (!i2c_write(i2c_default, AS5600_ADDRESS, &raw_angle_register, 1, true)) {
+    uint16_t angle; // [0, 16384)
+    if (!spi_request(spi_default, AS5048A_ANGLE_COMMAND, &angle, true)) {
       continue;
     }
-    if (!i2c_read(i2c_default, AS5600_ADDRESS, angle_bytes, 2, false)) {
-      continue;
-    }
-    uint16_t angle = (angle_bytes[0] << 8 | angle_bytes[1]) & ((1 << 12) - 1);
 
     // Adjust the volume based on the change in the angle.
-    volume = MAX(
-        0, MIN(4095, volume + ((6144 + angle) - previous_angle) % 4096 - 2048));
+    volume =
+        MAX(0, MIN(16383,
+                   volume + (24576 + (previous_angle - angle)) % 16384 - 8192));
 
     // Set the duty cycle of the LED based on the volume.
-    int progress = volume / 64; // [0, 64)
+    int progress = volume / 256; // [0, 64)
     int remaining = 63 - progress;
     pwm_set_chan_level(slice_num, channel, progress);
 
@@ -122,8 +188,8 @@ int main() {
     for (int i = 0; i < remaining; ++i) {
       printf("-");
     }
-    printf("] %10f%%  Magentic field strength: %d\n", 100.0f * volume / 4095.0f,
-           gain);
+    printf("] %10f%%  Magentic field strength: %d\n",
+           100.0f * volume / 16383.0f, gain);
 
     // Remember the angle for the next iteration.
     previous_angle = angle;

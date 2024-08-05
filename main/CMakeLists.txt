@@ -14,8 +14,8 @@ add_executable(main
 )
 
 target_link_libraries(main
-  hardware_i2c
   hardware_pwm
+  hardware_spi
   pico_stdlib
 )
 
