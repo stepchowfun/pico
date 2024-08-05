@@ -5,9 +5,11 @@
 #include "pico/time.h"
 #include <stdio.h>
 
+// Determined by experimentation
 #define I2C_BAUD_RATE 1000 * 1000
 #define I2C_PER_BYTE_TIMEOUT_US 1000
 
+// From the AS5600 datasheet
 #define AS5600_ADDRESS 0x36
 #define AS5600_RAW_ANGLE_REGISTER 0x0c
 #define AS5600_AGC_REGISTER 0x1a
@@ -82,8 +84,9 @@ int main() {
   // the angle from the previous iteration.
   uint16_t previous_angle = 0; // [0, 4096)
 
+  // The main program loop
   while (true) {
-    // Compute the gain.
+    // Read the gain.
     uint8_t gain = 0; // [0, 128]
     if (!i2c_write(i2c_default, AS5600_ADDRESS, &agc_register, 1, true)) {
       continue;
@@ -92,7 +95,7 @@ int main() {
       continue;
     }
 
-    // Compute the angle.
+    // Read the angle.
     uint8_t angle_bytes[2] = {0, 0}; // [0, 4096)
     if (!i2c_write(i2c_default, AS5600_ADDRESS, &raw_angle_register, 1, true)) {
       continue;
@@ -106,8 +109,8 @@ int main() {
     volume = MAX(
         0, MIN(4095, volume + ((6144 + angle) - previous_angle) % 4096 - 2048));
 
-    // Set thw duty cycle of the LED based on the volume.
-    int progress = volume / 64;
+    // Set the duty cycle of the LED based on the volume.
+    int progress = volume / 64; // [0, 64)
     int remaining = 63 - progress;
     pwm_set_chan_level(slice_num, channel, progress);
 
