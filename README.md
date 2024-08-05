@@ -4,7 +4,7 @@
 
 This repository contains the scaffolding for programming and debugging a [Raspberry Pi Pico or Pico W](https://www.raspberrypi.com/documentation/microcontrollers/raspberry-pi-pico.html).
 
-It currently has a simple demo program that reads the raw angle from an AS5600 magnetic rotary position sensor over I²C and emits some output via UART and an LED.
+It currently has a simple demo program that reads the raw angle from an AS5048A magnetic rotary position sensor over SPI and emits some output via UART and an LED.
 
 ## Instructions
 
