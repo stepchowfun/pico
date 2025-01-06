@@ -1,5 +1,7 @@
 # Raspberry Pi Pico example
 
+[![Build status](https://github.com/stepchowfun/pico/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stepchowfun/pico/actions?query=branch%3Amain)
+
 This repository contains the scaffolding for programming and debugging a [Raspberry Pi Pico or Pico W](https://www.raspberrypi.com/documentation/microcontrollers/raspberry-pi-pico.html).
 
 It currently has a simple demo program that reads the raw angle from an AS5048A magnetic rotary position sensor over SPI and emits some output via UART and an LED.
